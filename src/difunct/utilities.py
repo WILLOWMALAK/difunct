@@ -1,14 +1,15 @@
 import os
 import os.path as path
-import numpy as np
 from collections import defaultdict
+
+import numpy as np
 from scipy.ndimage import gaussian_filter, binary_fill_holes, label
 from scipy.ndimage import distance_transform_edt
 import nibabel as nib
 from nilearn.image import resample_to_img
 from nibabel.processing import resample_from_to
 from nibabel.nifti1 import Nifti1Image
-from nilearn.maskers import NiftiLabelsMasker
+from nilearn.maskers import NiftiLabelsMasker, NiftiMasker
 from nilearn.interfaces.fmriprep import load_confounds_strategy
 from nilearn.connectome import ConnectivityMeasure
 from dipy.io.stateful_tractogram import Space, StatefulTractogram
@@ -19,7 +20,9 @@ from unravel.utils import get_streamline_density
 from unravel.stream import smooth_streamlines
 from tqdm import tqdm
 import sparse
-
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import zscore
 
 
 def mask_generator(white_matter_probability,
@@ -158,6 +161,8 @@ def voxel_to_streamline_map(streamlines, vol_shape):
 
     failure_count = 0
 
+    # Try to upsample the streamlines
+
     min_coord = 100000000
     max_coord = -1000000
     for idx, streamline in enumerate(tqdm(streamlines, "Vox-SL")):
@@ -187,31 +192,160 @@ def voxel_to_streamline_map(streamlines, vol_shape):
     # Convert sets → lists for downstream use
     return {k: list(v) for k, v in mapping.items()}
 
-def generate_masks(wm_mask, test_masks = False):
-    if test_masks:
-        mask_1 = nib.load("/Users/sam/Desktop/sub-TAU001/one_white_matter_mask.nii.gz")
-        mask_2 = nib.load("/Users/sam/Desktop/sub-TAU001/two_white_matter_mask.nii.gz")
-        return np.stack([mask_1.get_fdata(), mask_2.get_fdata()], axis=0)
-    else:
-        if type(wm_mask) == Nifti1Image:
-            wm_data = wm_mask.get_fdata()
-        else: 
-            wm_data = wm_mask
-       
-        wm_positions = np.array(np.nonzero(wm_data)).T
-        
-        return wm_positions
+def voxel_to_streamline_map_V2(
+        streamlines, 
+        vol_shape, 
+        subsegment:int = 1):
+    
+    mapping = defaultdict(set)
 
+    failure_count = 0
+
+    points = streamlines.get_data()
+
+    # Creating subpoints
+    subpoint = np.linspace(points, np.roll(points, -1, axis=0),
+                           subsegment+1, axis=1)
+    points = subpoint[:, :-1, :].reshape(points.shape[0]*subsegment, 3)
+    del subpoint
+
+    subsegment_offsets = ((streamlines._offsets + streamlines._lengths-1)
+                         * subsegment)
+
+    # Try to upsample the streamlines
+
+    min_coord = 100000000
+    max_coord = -1000000
+    for idx, offset in enumerate(tqdm(subsegment_offsets, "Vox-SL")):
+       # Force an integer value for the streamline index
+        if idx >= len(subsegment_offsets)-1:
+            streamline=points[offset:-subsegment+1]
+        else:
+            streamline=points[offset:subsegment_offsets[idx+1]-subsegment+1]
+
+        vox = np.round(streamline).astype(np.int32)
+
+        try:
+            if vox.min() < min_coord:
+                min_coord = vox.min()
+            if vox.max() > max_coord:
+                max_coord = vox.max()
+        except Exception as e:
+            print(e)
+            print(vox)
+            print(offset)
+            print(idx)
+            print(streamline.shape)
+               
+
+        # Remove points outside the shape
+        valid_vox = (
+                        (vox[:,0] >= 0) & (vox[:, 0] < vol_shape[0]) &
+                        (vox[:,1] >= 0) & (vox[:, 1] < vol_shape[1]) &
+                        (vox[:,2] >= 0) & (vox[:, 2] < vol_shape[2])
+        )
+        if np.sum(valid_vox) < 3:
+            failure_count += 1
+        vox = vox[valid_vox]
+
+        # One streamline should only be counted once per voxel
+        for v in map(tuple, np.unique(vox, axis=0)):
+            mapping[v].add(idx)
+            
+    # Convert sets → lists for downstream use
+    return {k: list(v) for k, v in mapping.items()}
+
+def mask_to_positions(mask):
+    if type(mask) == Nifti1Image:
+        wm_data = mask.get_fdata()
+    else: 
+        wm_data = mask
+    
+    wm_positions = np.array(np.nonzero(wm_data)).T
+    
+    return wm_positions
 
 def is_sparse(arr):
     return isinstance(arr, sparse.COO)
 
+def nifti_vs_img(object):
+    """
+    Checks input to insure it is either a nifti image, 
+    or a path to a nifti image
+    
+    :param object: the object provided
+    """
+    if type(object) is str:
+        img = nib.load(object)
+    elif type(object) is Nifti1Image:
+        img = object
+    else:
+        raise TypeError(("Image should be provided as either a path "
+            "to an Nifti image, or Nifti image object."))
+    return img
+
+def transform_masker(bold_data, masker, bold_filepath, discard_initial):
+    if bold_filepath is not None:
+        counfounds_df,_= load_confounds_strategy(bold_filepath,
+                                            denoise_strategy="simple")
+        time_series = masker.fit_transform(bold_data, 
+                                           confounds=counfounds_df)    
+    else:
+        time_series = masker.fit_transform(bold_data)
+
+    return time_series
+
+def create_ROI_time_series(
+        atlas, 
+        bold_data, 
+        discard_initial:int = 3,
+        bold_filepath= None, 
+        normalise:bool = True):
+    
+    aal_img = nifti_vs_img(atlas)
+
+    masker = NiftiLabelsMasker(labels_img=aal_img, standardize=normalise)
+
+    return transform_masker(bold_data=bold_data, 
+                            masker = masker,
+                            discard_initial=discard_initial)
+
+def create_VOX_time_series(
+        mask,
+        bold_data, 
+        discard_initial:int = 3,
+        normalise:bool = True):
+    
+    masker = NiftiMasker(mask_img=mask,
+                         standardize=normalise)
+    
+    return transform_masker(bold_data=bold_data, 
+                            masker = masker,
+                            discard_initial=discard_initial)
+    
+def fc_mat_gen(
+        timeseries, 
+        method: str = "nilearn", 
+        kind: str = "correlation"):
+        
+    # Correlation Matrix
+    if method == "nilearn":
+        conn_measure = ConnectivityMeasure(kind=kind, standardize=False)
+        conn_matrix = conn_measure.fit_transform([timeseries])[0]
+    elif method == "custom":
+        conn_matrix = matrix_computation(time_series=timeseries)
+    else:
+        raise ValueError("Enter a valid method: nilearn or custom")
+    
+    return conn_matrix
+    
 def connectivity_matrix_generation(bold, 
                                    atlas, 
                                    normalise, 
                                    method= "nilearn", 
                                    kind = "correlation", 
-                                   bold_filepath=None):
+                                   bold_filepath=None, 
+                                   return_time_series = False):
     if type(atlas) is str:
         aal_img = nib.load(atlas)
     elif type(atlas) is Nifti1Image:
@@ -233,20 +367,21 @@ def connectivity_matrix_generation(bold,
     
     # Correlation Matrix
     if method == "nilearn":
-        conn_measure = ConnectivityMeasure(kind=kind)
+        conn_measure = ConnectivityMeasure(kind=kind, standardize=False)
         conn_matrix = conn_measure.fit_transform([time_series])[0]
     elif method == "custom":
         conn_matrix = matrix_computation(time_series)
     else:
         raise ValueError("Enter a valid method: nilearn or custom")
-
+    
+    if return_time_series:
+        return conn_matrix, time_series
+    
     return conn_matrix
 
 def matrix_computation(time_series):
     matrix = np.corrcoef(time_series,rowvar=False )
     return matrix
-
-
 
 def atlas_registration(atlas_path, 
                        template_file, 
@@ -275,7 +410,7 @@ def atlas_registration(atlas_path,
     """
     # First, match the atlas to the patient (this will be a slow step so try 
     # and cache it). Save it somewhere and then just check that filepath.
-    img = nib.load(template_file)
+    img = nifti_vs_img(atlas_path)
 
     if  remap == False and path.exists(save_path):
         registered_atlas = nib.load(save_path)
@@ -291,7 +426,6 @@ def atlas_registration(atlas_path,
 
         out = nib.Nifti1Image(registered_atlas.astype(float), img.affine) 
         out.to_filename(save_path)
-
 
 def dilate_atlas_labels(atlas, brain_mask, dilation_width):
     """
@@ -335,4 +469,119 @@ def dilate_atlas_labels(atlas, brain_mask, dilation_width):
         dilated_atlas[x, y, z] = atlas[nx, ny, nz]
 
     return dilated_atlas
+
+def visualise_square_mat(matrix, title = "Square Matrix Visualisation"):
+        mask = np.triu(np.ones_like(matrix, dtype=bool))
+
+            # Set up the matplotlib figure
+        f, ax = plt.subplots(figsize=(11, 9))
+
+        # Generate a custom diverging colormap
+        cmap = sns.diverging_palette(230, 20, as_cmap=True)
+
+        # Draw the heatmap with the mask and correct aspect ratio
+        sns.heatmap(matrix, mask=mask, cmap=cmap, center=0,
+                    square=True, linewidths=.5, cbar_kws={"shrink": .5})
+        plt.title(title)
+        plt.show()
+
+def normalise(array_like, shift_zero: bool = False):
+    """
+    Docstring for normalise
+    
+    :param array_like: Matrix or array to normalise
+    :param shift_zero: Whether to shift all data such that 0 is the minimum
+    :type shift_zero: bool
+    """
+    scores = zscore(array_like)
+    minimum = np.min(scores)
+    if minimum < 0:
+        scores = scores - minimum
+    return scores
+
+def atlas_masker(atlas_data:np.array, target_labels:list):
+    """Create a mask of an atlas that retains only the specified label values.
+    Parameters
+    ----------
+    atlas_data : numpy.ndarray
+        Array of labeled regions (e.g., an atlas volume or parcellation). Values
+        are expected to be label identifiers (commonly integers). The input array's
+        shape and dtype are preserved in the returned mask.
+    target_labels : Sequence[int]
+        Iterable of label values to keep in the output. All entries not matching
+        any of these labels will be set to 0 in the returned array.
+    Returns
+    -------
+    numpy.ndarray
+        An array with the same shape and dtype as atlas_data where entries that
+        match any value in target_labels retain their original label value and
+        all other entries are zero.
+    Notes
+    -----
+    - The function prints the indices of nonzero entries for each target label as
+      a side effect.
+    - If a requested label is not present in atlas_data, it simply has no effect.
+    - The input atlas_data is not modified; a new array is returned.
+    """
+    masked_atlas = np.zeros_like(atlas_data)
+    for value in target_labels:
+        masked_atlas_v = np.where(atlas_data == value, atlas_data, 0)
+        masked_atlas = np.where(masked_atlas_v!=0, masked_atlas_v, masked_atlas)
+    
+    return masked_atlas
+
+def parse_nib_file(image_obj):
+    if type(image_obj) is str:
+        pass
+
+def time_slicing(data, slice_length, sliding= False, axis:int = 3):
+    """
+    Divides a bold signal into time windows. 
+    
+    :param bold_data: 4D numpy array
+        fMRI data with dimensions (x, y, z, time)
+    :param slice_length: int
+        Length of each time slice
+
+    Notes:
+        - Currently discards any excess time points that are not 
+            divisible by the slice_length. Consider your slice length 
+            value carefully.
+    """
+    slices = []
+    axis_size = data.shape[axis]
+
+    if not sliding:
+        num_slices = axis_size // slice_length
+        for i in range(num_slices):
+            start = i * slice_length
+            end = start + slice_length
+
+            slicer = [slice(None)] * data.ndim
+            slicer[axis] = slice(start, end)
+
+            slices.append(data[tuple(slicer)])
+
+    else:
+        idx = 0
+        while idx <= axis_size - slice_length:
+            end = idx + slice_length
+
+            slicer = [slice(None)] * data.ndim
+            slicer[axis] = slice(idx, end)
+
+            slices.append(data[tuple(slicer)])
+            idx += 1
+
+    return np.stack(slices)
+
+def create_masked_T1(t1_file, mask_file, file_path):
+    t1_img = nib.load(t1_file)
+    t1_data = t1_img.get_fdata()
+    mask_img = nib.load(mask_file)
+    mask_data = mask_img.get_fdata()
+    t1_data *= mask_data
+    out = nib.Nifti1Image(t1_data, t1_img.affine)
+    out.to_filename(file_path)
+    return out
 
