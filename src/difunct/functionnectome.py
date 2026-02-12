@@ -22,7 +22,8 @@ from nilearn.regions import signals_to_img_labels
 from utilities import (voxel_to_streamline_map, 
                        mask_generator, 
                        is_sparse, 
-                       mask_to_positions)
+                       mask_to_positions,
+                       nifti_vs_img)
 
 NOISE_OFFSET = 5
 
@@ -86,7 +87,8 @@ def vectorised_probability_maps(
         brain_template,
         v2f_mapping,
         smoothing = False, 
-        mode = "roi"):
+        mode = "roi", 
+        verbose = False):
     """
     Docstring for vectorised_probability_maps
     
@@ -106,29 +108,27 @@ def vectorised_probability_maps(
     """
 
     # Move the tractogram to the corner of the voxel
-    trk.to_vox()
-    trk.to_corner()
-    
+    #trk.to_corner()
+
+ 
     # Extract the overall density map
-    overall_density_map = density_map(streamlines=trk.streamlines, 
-                                       affine=np.eye(4),
-                                       vol_dims=trk.dimensions)
+    overall_density_map = density_map(
+        streamlines=trk.streamlines,
+        affine=np.eye(4),
+        vol_dims=trk.dimensions)
     
     if smoothing:
-        overall_density_map = gaussian_filter(overall_density_map, 1.0)
+        overall_density_map = gaussian_filter(
+            overall_density_map, 
+            1.0
+        )
     
-
     """ Iterate through the atlas regions and extract only the streamlines
         that go through each region. (116 iterations, will give a NxN 
         matrix for each ROI, where N is the number of white matter voxels) """
-
-
     if mode == "roi":
-        print("\tUsing the ROI mode")
-
         atlas_matrix = registered_atlas.get_fdata()
         roi_ids = np.unique(atlas_matrix) 
-
         # Stack the density maps up into a single array.
         N = len(roi_ids)-1
         all_density_maps = np.zeros(
@@ -152,16 +152,30 @@ def vectorised_probability_maps(
                                             mask = mask,
                                             affine = np.eye(4))
             
+            trk_new = trk.from_sft(
+                relevant_streamlines, 
+                trk
+            )
 
-            trk_new = trk.from_sft(relevant_streamlines, trk)
+            if len(trk_new.streamlines) == 0:
+                print(f"Warning: Region {roi} has 0 streamlines")
 
-            # Get a density map of the relevant streamlines
-            # Use the white matter mask here? 
+            if verbose:
+                max_coord = np.max(np.vstack(trk_new.streamlines), axis=0)
+                min_coord = np.min(np.vstack(trk_new.streamlines), axis=0)
+                print("Min:", min_coord)
+                print("Max:", max_coord)
+                print("Shape:", trk.dimensions)
+                
+                print(f"The origin is: {trk.origin}\n"
+                    f"The space is: {trk.space}\n"
+                    f"Dimensions: {trk.dimensions}"
+                )
             roi_density_map = density_map(
-                streamlines=relevant_streamlines, 
+                streamlines=trk_new.streamlines, 
                 affine=np.eye(4), 
-                vol_dims=trk.dimensions)
-
+                vol_dims=trk.dimensions
+            )
             if smoothing:
                 roi_density_map = gaussian_filter(roi_density_map, 1.0)
             # Output the density maps so that they can be visualised
@@ -231,7 +245,7 @@ def compute_connection_probability(
 
 def normalizer(funct_results, 
                probability_maps, 
-               method = "basic", 
+               method = "basic",
                bold_min = None, 
                bold_max = None):
     """
@@ -278,12 +292,18 @@ def normalizer(funct_results,
         if bold_min == None or bold_max == None:
             raise ValueError("Please enter the parameters bold_min and " \
                             "bold_max (numeric) to use the hack method.")
-        
+        max_val = funct_results.max()
+        min_val = funct_results.min()
+        if max_val-min_val==0:
+            raise ValueError("All values are zero. Ensure that the atlas and " \
+                "the streamlines overlap")
         normalised = (((funct_results-funct_results.min())
-                        / (funct_results.max()- funct_results.min())) 
+                        / (max_val- min_val)) 
                          * (bold_max-bold_min)
                          + bold_min)
         return normalised
+    elif method == "none":
+        return funct_results
     else:
         raise ValueError("Please enter a valid method "
                         "('basic', 'self-sum', 'voxel_sum', 'hack')")
@@ -294,9 +314,9 @@ def normalizer(funct_results,
 def functionnectome(probability_maps, 
                     timeseries, 
                     registered_atlas,
-                    extensive_visualisation=None, 
-                    debug_prints= False, 
-                    grey_matter_mask = None):
+                    normalisation="hack",
+                    extensive_visualisation=False, 
+                    debug_prints= False):
     """
     Computes the functionnectome based on a probability of 
     connection map and the fmri data.
@@ -313,14 +333,15 @@ def functionnectome(probability_maps,
         T1 space.
     """
 
-    if extensive_visualisation != None:
-        reg_atlas_img = nib.load(registered_atlas)
+    if extensive_visualisation != False:
+        reg_atlas_img = nifti_vs_img(registered_atlas)
         img_by_ROI = signals_to_img_labels(signals=timeseries,
                                         labels_img=reg_atlas_img)
         img_by_ROI.to_filename(extensive_visualisation)
 
     bold_max = np.max(timeseries)
     bold_min = np.min(timeseries)
+
     if debug_prints:
         print(f"Minimum BOLD value: {bold_min}\nMaximum BOLD value: {bold_max}"
               f"Shape of prob_maps: { probability_maps.shape}"
@@ -331,16 +352,20 @@ def functionnectome(probability_maps,
         funct_result = sparse.tensordot(timeseries, probability_maps)
     else:
         funct_result = tensordot(timeseries, probability_maps,1) 
-        # need to double check the shapes of the roi_timeseries.
+
+    print(f"\tNANs 1 : {np.sum(np.isnan(funct_result))}")
 
     funct_result = normalizer(
         funct_results=funct_result,
         probability_maps=probability_maps,
-        method="hack",
+        method=normalisation,
         bold_min=bold_min,
         bold_max=bold_max)
 
+    print(f"\tNANs 2: {np.sum(np.isnan(funct_result))}")
+
     funct_result = np.transpose(funct_result, (1,2,3,0))
+
     if debug_prints:
         print(f"Max F value: {funct_result.max()}\n"
               f"Min F value: {funct_result.min()}"
